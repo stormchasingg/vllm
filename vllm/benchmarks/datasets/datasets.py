@@ -2115,7 +2115,9 @@ def get_samples(
             tokenizer=tokenizer,
             output_len=args.custom_output_len,
             skip_chat_template=args.skip_chat_template,
-            chat_template_kwargs=getattr(args, "chat_template_kwargs", None),
+            chat_template_kwargs=(getattr(args, "extra_body", None) or {}).get(
+                "chat_template_kwargs", getattr(args, "chat_template_kwargs", None)
+            ),
             request_id_prefix=args.request_id_prefix,
             no_oversample=args.no_oversample,
         )
@@ -2515,6 +2517,13 @@ class CustomDataset(BenchmarkDataset):
     'custom-output-len' argument is None or -1.
     """
 
+    def __new__(cls, **kwargs):
+        if cls is CustomDataset:
+            dataset_class = _get_custom_dataset_class(kwargs.get("dataset_path"))
+            if dataset_class is not CustomDataset:
+                return super().__new__(dataset_class)
+        return super().__new__(cls)
+
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
         self.load_data()
@@ -2629,6 +2638,165 @@ class CustomDataset(BenchmarkDataset):
         )
 
         return sampled_requests
+
+
+class OpenAIMessagesDataset(CustomDataset):
+    """Custom JSONL dataset containing OpenAI-compatible chat messages."""
+
+    _REQUEST_OVERRIDE_EXCLUDED_FIELDS = {
+        "messages",
+        "model",
+        "output_tokens",
+        "max_tokens",
+        "max_completion_tokens",
+        "prompt",
+    }
+
+    def load_data(self) -> None:
+        if self.dataset_path is None:
+            raise ValueError("dataset_path must be provided for loading data.")
+        if not self.dataset_path.endswith(".jsonl"):
+            raise NotImplementedError(
+                "Only JSONL format is supported for OpenAIMessagesDataset."
+            )
+
+        self.data = []
+        with open(self.dataset_path, encoding="utf-8") as file:
+            for line_number, line in enumerate(file, start=1):
+                if not line.strip():
+                    continue
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError as error:
+                    raise ValueError(
+                        f"Invalid JSON on line {line_number} of {self.dataset_path}."
+                    ) from error
+                if not isinstance(item, dict) or "messages" not in item:
+                    raise ValueError(
+                        f"Line {line_number} of {self.dataset_path} must be "
+                        "a JSON object containing a 'messages' field."
+                    )
+                messages = item["messages"]
+                if not isinstance(messages, list) or not messages:
+                    raise ValueError(
+                        f"'messages' on line {line_number} of "
+                        f"{self.dataset_path} must be a non-empty list."
+                    )
+                self.data.append(item)
+
+        random.seed(self.random_seed)
+        if not self.disable_shuffle:
+            random.shuffle(self.data)
+
+    def sample(
+        self,
+        tokenizer: TokenizerLike | None,
+        num_requests: int,
+        request_id_prefix: str = "",
+        no_oversample: bool = False,
+        lora_path: str | None = None,
+        max_loras: int | None = None,
+        output_len: int | None = None,
+        enable_multimodal_chat: bool = False,
+        skip_chat_template: bool = False,
+        chat_template_kwargs: dict | None = None,
+        **kwargs: Any,
+    ) -> list[SampleRequest]:
+        self.num_available_samples = len(self.data)
+        if num_requests <= 0:
+            num_requests = self.num_available_samples
+            logger.info(
+                "num_requests is set to 0 or negative, "
+                "so using all available samples: %d",
+                num_requests,
+            )
+
+        sampled_requests: list[SampleRequest] = []
+        for i, item in enumerate(self.data):
+            if len(sampled_requests) >= num_requests:
+                break
+            messages = item["messages"]
+            if tokenizer is None:
+                prompt = ""
+                prompt_len = 1
+                new_output_len = 1
+            else:
+                prompt = cast(
+                    str,
+                    tokenizer.apply_chat_template(
+                        messages,
+                        add_generation_prompt=True,
+                        tokenize=False,
+                        **(chat_template_kwargs or {}),
+                    ),
+                )
+                prompt_len = len(tokenizer(prompt).input_ids)
+                new_output_len = self._get_output_len(item, output_len)
+
+            sampled_requests.append(
+                SampleRequest(
+                    prompt=prompt,
+                    prompt_len=prompt_len,
+                    expected_output_len=new_output_len,
+                    request_id=request_id_prefix + str(i),
+                    chat_messages=messages,
+                    request_overrides={
+                        key: value
+                        for key, value in item.items()
+                        if key not in self._REQUEST_OVERRIDE_EXCLUDED_FIELDS
+                    },
+                )
+            )
+        self.maybe_oversample_requests(
+            sampled_requests, num_requests, request_id_prefix, no_oversample
+        )
+        return sampled_requests
+
+    @staticmethod
+    def _get_output_len(item: dict, output_len: int | None) -> int:
+        if output_len is not None and output_len != -1:
+            return output_len
+        item_output_len = item.get(
+            "output_tokens",
+            item.get("max_completion_tokens", item.get("max_tokens")),
+        )
+        if item_output_len is None:
+            raise ValueError(
+                "If no output length is provided the custom dataset must "
+                "contain an 'output_tokens', 'max_completion_tokens', or "
+                "'max_tokens' field."
+            )
+        try:
+            return int(item_output_len)
+        except (ValueError, TypeError) as error:
+            raise ValueError(
+                f"Invalid output length in custom dataset: "
+                f"'{item_output_len}'. Must be an integer."
+            ) from error
+
+
+def _get_custom_dataset_class(dataset_path: str | None) -> type[CustomDataset]:
+    """Route a custom JSONL file based on its first non-empty record."""
+    if dataset_path is None:
+        raise ValueError("dataset_path must be provided for a custom dataset.")
+    with open(dataset_path, encoding="utf-8") as file:
+        for line_number, line in enumerate(file, start=1):
+            if not line.strip():
+                continue
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError as error:
+                raise ValueError(
+                    f"Invalid JSON on line {line_number} of {dataset_path}."
+                ) from error
+            if not isinstance(item, dict):
+                raise ValueError(
+                    f"Line {line_number} of {dataset_path} must be a JSON object."
+                )
+            if "messages" in item:
+                return OpenAIMessagesDataset
+            return CustomDataset
+    raise ValueError(f"Custom dataset {dataset_path} is empty.")
 
 
 class CustomImageDataset(CustomDataset):

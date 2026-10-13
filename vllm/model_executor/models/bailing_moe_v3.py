@@ -401,8 +401,8 @@ def _maybe_pad_block_fp8_shared_expert_checkpoint_tensor(
     )
 
 
-class _IdentityProjection(nn.Module):
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, None]:
+class _IdentityProjection(torch.nn.Identity):
+    def forward(self, x: torch.Tensor, *args, **kwargs) -> tuple[torch.Tensor, None]:
         return x, None
 
 

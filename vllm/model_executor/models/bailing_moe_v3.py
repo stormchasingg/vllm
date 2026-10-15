@@ -131,6 +131,21 @@ def _is_kda_layer(
     )
 
 
+def _pack_kda_conv_inputs(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    v_weight: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pack independent Q/K/V depthwise convolutions into one invocation."""
+    return (
+        torch.cat((q, k, v), dim=-1),
+        torch.cat((q_weight, k_weight, v_weight), dim=0),
+    )
+
+
 def _get_kda_state_shape_for_config(
     vllm_config: VllmConfig,
 ) -> tuple[tuple[int, int], tuple[int, int, int]]:
@@ -904,30 +919,28 @@ class BailingMoeV3KimiDeltaAttention(PluggableLayer, MambaBase):
             self.v_conv1d.weight.size(0), self.v_conv1d.weight.size(2)
         )
 
+        # Decode all three projections with one packed convolution, matching
+        # Kimi K3.  Besides reducing launch overhead, keeping the full state
+        # intact avoids passing row-strided Q/K/V cache views to backends that
+        # must otherwise materialize each view before updating it.
         if spec_sequence_masks is not None:
             assert q_proj_states_spec is not None
             assert k_proj_states_spec is not None
             assert v_proj_states_spec is not None
             assert spec_state_indices is not None
-            q_spec = causal_conv1d_update(
+            qkv_spec, conv_weights = _pack_kda_conv_inputs(
                 q_proj_states_spec,
-                conv_state_q,
-                q_conv_weights,
-                self.q_conv1d.bias,
-                activation="silu",
-                conv_state_indices=spec_state_indices[:, 0][
-                    : attn_metadata.num_spec_decodes
-                ],
-                num_accepted_tokens=num_accepted_tokens,
-                query_start_loc=spec_query_start_loc,
-                max_query_len=spec_state_indices.size(-1),
-                validate_data=False,
-            )
-            k_spec = causal_conv1d_update(
                 k_proj_states_spec,
-                conv_state_k,
+                v_proj_states_spec,
+                q_conv_weights,
                 k_conv_weights,
-                self.k_conv1d.bias,
+                v_conv_weights,
+            )
+            qkv_spec = causal_conv1d_update(
+                qkv_spec,
+                conv_state,
+                conv_weights,
+                None,
                 activation="silu",
                 conv_state_indices=spec_state_indices[:, 0][
                     : attn_metadata.num_spec_decodes
@@ -937,19 +950,8 @@ class BailingMoeV3KimiDeltaAttention(PluggableLayer, MambaBase):
                 max_query_len=spec_state_indices.size(-1),
                 validate_data=False,
             )
-            v_spec = causal_conv1d_update(
-                v_proj_states_spec,
-                conv_state_v,
-                v_conv_weights,
-                self.v_conv1d.bias,
-                activation="silu",
-                conv_state_indices=spec_state_indices[:, 0][
-                    : attn_metadata.num_spec_decodes
-                ],
-                num_accepted_tokens=num_accepted_tokens,
-                query_start_loc=spec_query_start_loc,
-                max_query_len=spec_state_indices.size(-1),
-                validate_data=False,
+            q_spec, k_spec, v_spec = qkv_spec.split(
+                self.projection_size_per_partition, dim=-1
             )
         else:
             q_spec = k_spec = v_spec = None
@@ -997,32 +999,28 @@ class BailingMoeV3KimiDeltaAttention(PluggableLayer, MambaBase):
             assert v_proj_states_non_spec is not None
             assert state_indices is not None
             decode_indices = state_indices[:num_actual_tokens]
-            q = causal_conv1d_update(
+            qkv, conv_weights = _pack_kda_conv_inputs(
                 q_proj_states_non_spec,
-                conv_state_q,
-                q_conv_weights,
-                self.q_conv1d.bias,
-                activation="silu",
-                conv_state_indices=decode_indices,
-                validate_data=True,
-            )
-            k = causal_conv1d_update(
                 k_proj_states_non_spec,
-                conv_state_k,
+                v_proj_states_non_spec,
+                q_conv_weights,
                 k_conv_weights,
-                self.k_conv1d.bias,
+                v_conv_weights,
+            )
+            qkv = causal_conv1d_update(
+                qkv,
+                conv_state,
+                conv_weights,
+                None,
                 activation="silu",
                 conv_state_indices=decode_indices,
                 validate_data=True,
             )
-            v = causal_conv1d_update(
-                v_proj_states_non_spec,
-                conv_state_v,
-                v_conv_weights,
-                self.v_conv1d.bias,
-                activation="silu",
-                conv_state_indices=decode_indices,
-                validate_data=True,
+            q, k, v = (
+                part.contiguous()
+                for part in qkv.split(
+                    self.projection_size_per_partition, dim=-1
+                )
             )
         else:
             q = k = v = None
